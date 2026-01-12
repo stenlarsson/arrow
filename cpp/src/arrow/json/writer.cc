@@ -27,8 +27,8 @@
 #include "arrow/type_traits.h"
 #include "arrow/util/iterator.h"
 #include "arrow/visit_array_inline.h"
+#include "arrow/util/checked_cast.h"
 
-#include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
@@ -43,174 +43,270 @@ namespace rj = arrow::rapidjson;
 
 namespace {
 
-// \brief Builder that holds state for a single conversion.
-//
-// Implements Visit() methods for each type of Arrow Array that set the values
-// of the corresponding fields in each row.
-class RowBatchBuilder {
- public:
-  explicit RowBatchBuilder(int64_t num_rows, bool emit_null = true)
-      : field_(nullptr), emit_null_(emit_null) {
-    // Reserve all of the space required up-front to avoid unnecessary resizing
-    rows_.reserve(num_rows);
+class SingleValueWriter {
+public:
+  SingleValueWriter(int64_t value_idx, rj::Writer<rj::StringBuffer>& writer, bool emit_null)
+      : value_idx_(value_idx), writer_(writer), emit_null_(emit_null) {}
 
-    for (int64_t i = 0; i < num_rows; ++i) {
-      rows_.push_back(rj::Document());
-      rows_[i].SetObject();
-    }
+  Status Visit(const arrow::Array& array) {
+    return Status::NotImplemented("Single value writing not implemented for type: ",
+                                  array.type()->ToString());
   }
 
-  /// \brief Set which field to convert.
-  void SetField(const arrow::Field* field) { field_ = field; }
-
-  /// \brief Retrieve converted rows from builder.
-  std::vector<rj::Document> Rows() && { return std::move(rows_); }
-
-  // Default implementation
-  arrow::Status Visit(const arrow::Array& array) {
-    return arrow::Status::NotImplemented(
-        "Cannot convert to json document for array of type ", array.type()->ToString());
+  Status Visit(const arrow::BooleanArray& array) {
+    writer_.Bool(array.Value(value_idx_));
+    return Status::OK();
   }
 
-  // Handles booleans, integers, floats, temporal types
-  // (excludes interval types with struct C types)
   template <typename ArrayType, typename DataClass = typename ArrayType::TypeClass>
   arrow::enable_if_t<arrow::has_c_type<DataClass>::value &&
-                         !arrow::is_interval_type<DataClass>::value,
-                     arrow::Status>
+                        !arrow::is_interval_type<DataClass>::value &&
+                        !std::is_same<DataClass, arrow::BooleanType>::value,
+                    arrow::Status>
   Visit(const ArrayType& array) {
-    assert(static_cast<int64_t>(rows_.size()) == array.length());
+    using CType = typename ArrayType::TypeClass::c_type;
+    if constexpr (std::is_floating_point_v<CType>) {
+      writer_.Double(static_cast<double>(array.Value(value_idx_)));
+    } else {
+      writer_.Int64(static_cast<int64_t>(array.Value(value_idx_)));
+    }
+    return Status::OK();
+  }
+
+  template <typename ArrayType, typename T = typename ArrayType::TypeClass>
+  arrow::enable_if_string_like<T, arrow::Status> Visit(const ArrayType& array) {
+    std::string_view value_view = array.Value(value_idx_);
+    writer_.String(value_view.data(), static_cast<rj::SizeType>(value_view.size()));
+    return Status::OK();
+  }
+
+  Status Visit(const arrow::StructArray& array) {
+    const arrow::StructType* struct_type = array.struct_type();
+    writer_.StartObject();
+    for (int child_idx = 0; child_idx < struct_type->num_fields(); ++child_idx) {
+      const arrow::Field* child_field = struct_type->field(child_idx).get();
+      const std::string child_field_name = child_field->name();
+      const arrow::Array* child_array = array.field(child_idx).get();
+      writer_.Key(child_field_name);
+      SingleValueWriter child_writer(value_idx_, writer_, emit_null_);
+      ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*child_array, &child_writer));
+    }
+    writer_.EndObject();
+    return Status::OK();
+  }
+
+  template <typename ArrayType, typename T = typename ArrayType::TypeClass>
+  arrow::enable_if_list_like<T, arrow::Status> Visit(const ArrayType& array) {
+    writer_.StartArray();
+    auto list_len = array.value_length(value_idx_);
+    int64_t list_offset = array.value_offset(value_idx_);
+    std::shared_ptr<arrow::Array> list_values = array.values();
+    for (int64_t j = 0; j < list_len; ++j) {
+      int64_t nested_value_idx = list_offset + j;
+      if (list_values->IsNull(nested_value_idx) && !emit_null_) {
+        continue;
+      }
+      SingleValueWriter nested_writer(nested_value_idx, writer_, emit_null_);
+      ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*list_values, &nested_writer));
+    }
+    writer_.EndArray();
+    return Status::OK();
+  }
+
+  Status Visit(const arrow::NullArray& array) {
+    writer_.Null();
+    return Status::OK();
+  }
+
+private:
+  int64_t value_idx_;
+  rj::Writer<rj::StringBuffer>& writer_;
+  bool emit_null_;
+};
+
+class ArrayWriter {
+public:
+  ArrayWriter(const std::string& field_name,
+                    std::vector<std::unique_ptr<rj::Writer<rj::StringBuffer>>>& writers,
+                    bool emit_null)
+      : field_name_(field_name), writers_(writers), emit_null_(emit_null) {}
+
+  // Default implementation
+  Status Visit(const arrow::Array& array) {
+    return Status::NotImplemented("Direct writing not implemented for type: ",
+                                  array.type()->ToString());
+  }
+
+  // Handle booleans
+  Status Visit(const arrow::BooleanArray& array) {
     for (int64_t i = 0; i < array.length(); ++i) {
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
-      rj::Value str_key(field_->name(), rows_[i].GetAllocator());
+      writers_[i]->Key(field_name_);
       if (array.IsNull(i)) {
-        rows_[i].AddMember(str_key, rj::Value(), rows_[i].GetAllocator());
+        writers_[i]->Null();
       } else {
-        rows_[i].AddMember(str_key, array.Value(i), rows_[i].GetAllocator());
+        writers_[i]->Bool(array.Value(i));
       }
     }
-    return arrow::Status::OK();
+    return Status::OK();
+  }
+
+  // Handle primitive numeric types (integers, floats, temporal types)
+  template <typename ArrayType, typename DataClass = typename ArrayType::TypeClass>
+  arrow::enable_if_t<arrow::has_c_type<DataClass>::value &&
+                        !arrow::is_interval_type<DataClass>::value &&
+                        !std::is_same<DataClass, arrow::BooleanType>::value,
+                    arrow::Status>
+  Visit(const ArrayType& array) {
+    using CType = typename ArrayType::TypeClass::c_type;
+
+    for (int64_t i = 0; i < array.length(); ++i) {
+      if (array.IsNull(i) && !emit_null_) {
+        continue;
+      }
+      writers_[i]->Key(field_name_);
+      if (array.IsNull(i)) {
+        writers_[i]->Null();
+      } else {
+        if constexpr (std::is_floating_point_v<CType>) {
+          writers_[i]->Double(static_cast<double>(array.Value(i)));
+        } else {
+          writers_[i]->Int64(static_cast<int64_t>(array.Value(i)));
+        }
+      }
+    }
+    return Status::OK();
   }
 
   // Handle string types
   template <typename ArrayType, typename T = typename ArrayType::TypeClass>
   arrow::enable_if_string_like<T, arrow::Status> Visit(const ArrayType& array) {
-    assert(static_cast<int64_t>(rows_.size()) == array.length());
     for (int64_t i = 0; i < array.length(); ++i) {
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
-      rj::Value str_key(field_->name(), rows_[i].GetAllocator());
+      writers_[i]->Key(field_name_);
       if (array.IsNull(i)) {
-        rows_[i].AddMember(str_key, rj::Value(), rows_[i].GetAllocator());
+        writers_[i]->Null();
       } else {
         std::string_view value_view = array.Value(i);
-        rj::Value value;
-        value.SetString(value_view.data(), static_cast<rj::SizeType>(value_view.size()),
-                        rows_[i].GetAllocator());
-        rows_[i].AddMember(str_key, value, rows_[i].GetAllocator());
+        writers_[i]->String(value_view.data(),
+                            static_cast<rj::SizeType>(value_view.size()));
       }
     }
-    return arrow::Status::OK();
+    return Status::OK();
   }
 
-  // Handle struct
-  arrow::Status Visit(const arrow::StructArray& array) {
+  // Handle struct arrays
+  Status Visit(const arrow::StructArray& array) {
     const arrow::StructType* type = array.struct_type();
-
-    assert(static_cast<int64_t>(rows_.size()) == array.length());
-
-    RowBatchBuilder child_builder(rows_.size(), emit_null_);
-    for (int i = 0; i < type->num_fields(); ++i) {
-      const arrow::Field* child_field = type->field(i).get();
-      child_builder.SetField(child_field);
-      ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*array.field(i).get(), &child_builder));
-    }
-    std::vector<rj::Document> rows = std::move(child_builder).Rows();
 
     for (int64_t i = 0; i < array.length(); ++i) {
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
-      rj::Value str_key(field_->name(), rows_[i].GetAllocator());
+      writers_[i]->Key(field_name_);
       if (array.IsNull(i)) {
-        rows_[i].AddMember(str_key, rj::Value(), rows_[i].GetAllocator());
+        writers_[i]->Null();
       } else {
-        // Must copy value to new allocator
-        rj::Value row_val;
-        row_val.CopyFrom(rows[i], rows_[i].GetAllocator());
-        rows_[i].AddMember(str_key, row_val, rows_[i].GetAllocator());
+        // Start nested object
+        writers_[i]->StartObject();
+        
+        // Write all child fields for this row
+        for (int child_idx = 0; child_idx < type->num_fields(); ++child_idx) {
+          const arrow::Field* child_field = type->field(child_idx).get();
+          const std::string child_field_name = child_field->name();
+          const arrow::Array* child_array = array.field(child_idx).get();
+          
+          // Write the child field key
+          writers_[i]->Key(child_field_name);
+          
+          // Write the single value for this row from the child array
+          ARROW_RETURN_NOT_OK(WriteSingleValue(*child_array, i, *writers_[i], emit_null_));
+        }
+        
+        // End nested object
+        writers_[i]->EndObject();
       }
     }
-    return arrow::Status::OK();
+    return Status::OK();
   }
 
   // Handle list-like types
   template <typename ArrayType, typename T = typename ArrayType::TypeClass>
   arrow::enable_if_list_like<T, arrow::Status> Visit(const ArrayType& array) {
-    assert(static_cast<int64_t>(rows_.size()) == array.length());
-    // First create rows from values
     std::shared_ptr<arrow::Array> values = array.values();
-    RowBatchBuilder child_builder(values->length(), emit_null_);
-    const arrow::Field* value_field = array.list_type()->value_field().get();
-    std::string value_field_name = value_field->name();
-    child_builder.SetField(value_field);
-    ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*values.get(), &child_builder));
 
-    std::vector<rj::Document> rows = std::move(child_builder).Rows();
-
-    int64_t values_i = 0;
     for (int64_t i = 0; i < array.length(); ++i) {
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
-      rj::Document::AllocatorType& allocator = rows_[i].GetAllocator();
-      rj::Value str_key(field_->name(), allocator);
-
+      writers_[i]->Key(field_name_);
       if (array.IsNull(i)) {
-        rows_[i].AddMember(str_key, rj::Value(), allocator);
-        continue;
+        writers_[i]->Null();
+      } else {
+        // Start array
+        writers_[i]->StartArray();
+        
+        // Write all values in the list for this row
+        auto array_len = array.value_length(i);
+        int64_t offset = array.value_offset(i);
+        
+        for (int64_t j = 0; j < array_len; ++j) {
+          int64_t value_idx = offset + j;
+          if (values->IsNull(value_idx) && !emit_null_) {
+            continue;
+          }
+          
+          // Write single value to the current row's writer
+          ARROW_RETURN_NOT_OK(WriteSingleValue(*values, value_idx, *writers_[i], emit_null_));
+        }
+        
+        // End array
+        writers_[i]->EndArray();
       }
-
-      auto array_len = array.value_length(i);
-      rj::Value value;
-      value.SetArray();
-      value.Reserve(static_cast<rj::SizeType>(array_len), allocator);
-
-      for (int64_t j = 0; j < array_len; ++j) {
-        rj::Value row_val;
-        // Must copy value to new allocator
-        row_val.CopyFrom(rows[values_i][value_field_name], allocator);
-        value.PushBack(row_val, allocator);
-        ++values_i;
-      }
-
-      rows_[i].AddMember(str_key, value, allocator);
     }
-
-    return arrow::Status::OK();
+    return Status::OK();
   }
 
-  // Handle null
-  arrow::Status Visit(const arrow::NullArray& array) {
-    assert(static_cast<int64_t>(rows_.size()) == array.length());
+  // Handle null arrays
+  Status Visit(const arrow::NullArray& array) {
     if (emit_null_) {
       for (int64_t i = 0; i < array.length(); ++i) {
-        rj::Value str_key(field_->name(), rows_[i].GetAllocator());
-        rows_[i].AddMember(str_key, rj::Value(), rows_[i].GetAllocator());
+        writers_[i]->Key(field_name_);
+        writers_[i]->Null();
       }
     }
-    return arrow::Status::OK();
+    return Status::OK();
   }
 
- private:
-  const arrow::Field* field_;
-  std::vector<rj::Document> rows_;
+private:
+
+  // Helper to write a single value from an array to a specific writer
+  Status WriteSingleValue(const arrow::Array& values, int64_t value_idx,
+                          rj::Writer<rj::StringBuffer>& writer, bool emit_null) {
+    if (values.IsNull(value_idx) && !emit_null) {
+      return Status::OK();
+    }
+    
+    if (values.IsNull(value_idx)) {
+      writer.Null();
+      return Status::OK();
+    }
+    
+    // Use a visitor to write the value based on its type
+    SingleValueWriter value_writer(value_idx, writer, emit_null);
+    return arrow::VisitArrayInline(values, &value_writer);
+  }
+
+
+  const std::string& field_name_;
+  std::vector<std::unique_ptr<rj::Writer<rj::StringBuffer>>>& writers_;
   bool emit_null_;
 };
-
+ 
 class JSONWriterImpl : public ipc::RecordBatchWriter {
  public:
   static Result<std::shared_ptr<JSONWriterImpl>> Make(
@@ -223,20 +319,39 @@ class JSONWriterImpl : public ipc::RecordBatchWriter {
   }
 
   Status WriteRecordBatch(const RecordBatch& batch) override {
-    RowBatchBuilder builder{batch.num_rows(), options_.emit_null};
+    const int64_t num_rows = batch.num_rows();
+    const int num_columns = batch.num_columns();
 
-    for (int i = 0; i < batch.num_columns(); ++i) {
-      builder.SetField(batch.schema()->field(i).get());
-      ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*batch.column(i).get(), &builder));
+    // Create StringBuffer and Writer for each row
+    std::vector<std::unique_ptr<rj::StringBuffer>> buffers;
+    std::vector<std::unique_ptr<rj::Writer<rj::StringBuffer>>> writers;
+    buffers.reserve(num_rows);
+    writers.reserve(num_rows);
+
+    for (int64_t i = 0; i < num_rows; ++i) {
+      buffers.emplace_back(std::make_unique<rj::StringBuffer>());
+      writers.emplace_back(
+          std::make_unique<rj::Writer<rj::StringBuffer>>(*buffers[i].get()));
+      writers[i]->StartObject();
     }
 
-    for (const auto& doc : std::move(builder).Rows()) {
-      rj::StringBuffer sb;
-      rj::Writer<rj::StringBuffer> writer(sb);
-      doc.Accept(writer);
-      sb.Put('\n');
-      RETURN_NOT_OK(sink_->Write(sb.GetString()));
+    // Process each column and write directly to row writers
+    for (int col_idx = 0; col_idx < num_columns; ++col_idx) {
+      const arrow::Field* field = batch.schema()->field(col_idx).get();
+      const std::string field_name = field->name();
+      const arrow::Array* array = batch.column(col_idx).get();
+
+      ArrayWriter writer(field_name, writers, options_.emit_null);
+      ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*array, &writer));
     }
+
+    // Finalize objects and write to output
+    for (int64_t i = 0; i < num_rows; ++i) {
+      writers[i]->EndObject();
+      buffers[i]->Put('\n');
+      RETURN_NOT_OK(sink_->Write(buffers[i]->GetString()));
+    }
+
     stats_.num_record_batches++;
     return Status::OK();
   }
