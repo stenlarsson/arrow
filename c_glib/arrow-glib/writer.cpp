@@ -615,6 +615,195 @@ garrow_csv_writer_new(GArrowOutputStream *sink,
   }
 }
 
+struct GArrowJSONWriteOptionsPrivate
+{
+  arrow::json::WriteOptions write_options;
+};
+
+enum {
+  PROP_JSON_WRITE_OPTIONS_BATCH_SIZE = 1,
+  PROP_JSON_WRITE_OPTIONS_EMIT_NULL,
+};
+
+G_DEFINE_TYPE_WITH_PRIVATE(GArrowJSONWriteOptions, garrow_json_write_options, G_TYPE_OBJECT)
+
+#define GARROW_JSON_WRITE_OPTIONS_GET_PRIVATE(object)                                     \
+  static_cast<GArrowJSONWriteOptionsPrivate *>(                                           \
+    garrow_json_write_options_get_instance_private(GARROW_JSON_WRITE_OPTIONS(object)))
+
+static void
+garrow_json_write_options_finalize(GObject *object)
+{
+  auto priv = GARROW_JSON_WRITE_OPTIONS_GET_PRIVATE(object);
+
+  priv->write_options.~WriteOptions();
+
+  G_OBJECT_CLASS(garrow_json_write_options_parent_class)->finalize(object);
+}
+
+static void
+garrow_json_write_options_set_property(GObject *object,
+                                      guint prop_id,
+                                      const GValue *value,
+                                      GParamSpec *pspec)
+{
+  auto priv = GARROW_JSON_WRITE_OPTIONS_GET_PRIVATE(object);
+
+  switch (prop_id) {
+  case PROP_JSON_WRITE_OPTIONS_BATCH_SIZE:
+    priv->write_options.batch_size = g_value_get_int(value);
+    break;
+  case PROP_JSON_WRITE_OPTIONS_EMIT_NULL:
+    priv->write_options.emit_null = g_value_get_boolean(value);
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
+garrow_json_write_options_get_property(GObject *object,
+                                      guint prop_id,
+                                      GValue *value,
+                                      GParamSpec *pspec)
+{
+  auto priv = GARROW_JSON_WRITE_OPTIONS_GET_PRIVATE(object);
+
+  switch (prop_id) {
+  case PROP_JSON_WRITE_OPTIONS_BATCH_SIZE:
+    g_value_set_int(value, priv->write_options.batch_size);
+    break;
+  case PROP_JSON_WRITE_OPTIONS_EMIT_NULL:
+    g_value_set_boolean(value, priv->write_options.emit_null);
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
+garrow_json_write_options_init(GArrowJSONWriteOptions *object)
+{
+  auto priv = GARROW_JSON_WRITE_OPTIONS_GET_PRIVATE(object);
+  new (&priv->write_options) arrow::json::WriteOptions;
+  priv->write_options = arrow::json::WriteOptions::Defaults();
+}
+
+static void
+garrow_json_write_options_class_init(GArrowJSONWriteOptionsClass *klass)
+{
+  GParamSpec *spec;
+
+  auto gobject_class = G_OBJECT_CLASS(klass);
+
+  gobject_class->finalize = garrow_json_write_options_finalize;
+  gobject_class->set_property = garrow_json_write_options_set_property;
+  gobject_class->get_property = garrow_json_write_options_get_property;
+
+  auto write_options = arrow::json::WriteOptions::Defaults();
+
+  /**
+   * GArrowJSONWriteOptions:batch-size:
+   *
+   * Maximum number of rows processed at a time.
+   *
+   * The JSON writer converts and writes data in batches of N rows. This number can impact
+   * performance.
+   *
+   * Since: 23.0.0
+   */
+  spec = g_param_spec_int("batch-size",
+                          "Batch size",
+                          "Maximum number of rows processed at a time",
+                          1,
+                          G_MAXINT32,
+                          write_options.batch_size,
+                          static_cast<GParamFlags>(G_PARAM_READWRITE));
+  g_object_class_install_property(gobject_class, PROP_JSON_WRITE_OPTIONS_BATCH_SIZE, spec);
+
+  /**
+   * GArrowJSONWriteOptions:emit-null:
+   *
+   * Whether to emit null values in the JSON output.
+   *
+   * If true, null values are included as JSON null.
+   * If false, null values are omitted from the output entirely.
+   *
+   * Since: 23.0.0
+   */
+  spec = g_param_spec_boolean("emit-null",
+                              "Emit null",
+                              "Whether to emit null values in the JSON output",
+                              write_options.emit_null,
+                              static_cast<GParamFlags>(G_PARAM_READWRITE));
+  g_object_class_install_property(gobject_class, PROP_JSON_WRITE_OPTIONS_EMIT_NULL, spec);
+}
+
+/**
+ * garrow_json_write_options_new:
+ *
+ * Returns: A newly created #GArrowJSONWriteOptions.
+ *
+ * Since: 23.0.0
+ */
+GArrowJSONWriteOptions *
+garrow_json_write_options_new(void)
+{
+  auto json_write_options = g_object_new(GARROW_TYPE_JSON_WRITE_OPTIONS, nullptr);
+  return GARROW_JSON_WRITE_OPTIONS(json_write_options);
+}
+
+G_DEFINE_TYPE(GArrowJSONWriter, garrow_json_writer, GARROW_TYPE_RECORD_BATCH_WRITER);
+
+static void
+garrow_json_writer_init(GArrowJSONWriter *object)
+{
+}
+
+static void
+garrow_json_writer_class_init(GArrowJSONWriterClass *klass)
+{
+}
+
+/**
+ * garrow_json_writer_new:
+ * @sink: The output of the writer.
+ * @schema: The schema of the writer.
+ * @options: (nullable): Options for serialization.
+ * @error: (nullable): Return location for a #GError or %NULL.
+ *
+ * Returns: (nullable): A newly created #GArrowJSONWriter
+ *   or %NULL on error.
+ *
+ * Since: 23.0.0
+ */
+GArrowJSONWriter *
+garrow_json_writer_new(GArrowOutputStream *sink,
+                       GArrowSchema *schema,
+                       GArrowJSONWriteOptions *options,
+                       GError **error)
+{
+  auto arrow_sink = garrow_output_stream_get_raw(sink);
+  auto arrow_schema = garrow_schema_get_raw(schema);
+  arrow::json::WriteOptions arrow_write_options;
+  if (options) {
+    auto arrow_write_options_ptr = garrow_json_write_options_get_raw(options);
+    arrow_write_options = *arrow_write_options_ptr;
+  } else {
+    arrow_write_options = arrow::json::WriteOptions::Defaults();
+  }
+  auto arrow_writer_result =
+    arrow::json::MakeJSONWriter(arrow_sink, arrow_schema, arrow_write_options);
+  if (garrow::check(error, arrow_writer_result, "[json-writer][new]")) {
+    auto arrow_writer = *arrow_writer_result;
+    return garrow_json_writer_new_raw(&arrow_writer);
+  } else {
+    return nullptr;
+  }
+}
+
 G_END_DECLS
 
 GArrowRecordBatchWriter *
@@ -671,5 +860,20 @@ arrow::csv::WriteOptions *
 garrow_csv_write_options_get_raw(GArrowCSVWriteOptions *options)
 {
   auto priv = GARROW_CSV_WRITE_OPTIONS_GET_PRIVATE(options);
+  return &priv->write_options;
+}
+
+GArrowJSONWriter *
+garrow_json_writer_new_raw(std::shared_ptr<arrow::ipc::RecordBatchWriter> *arrow_writer)
+{
+  auto writer = GARROW_JSON_WRITER(
+    g_object_new(GARROW_TYPE_JSON_WRITER, "record-batch-writer", arrow_writer, nullptr));
+  return writer;
+}
+
+arrow::json::WriteOptions *
+garrow_json_write_options_get_raw(GArrowJSONWriteOptions *options)
+{
+  auto priv = GARROW_JSON_WRITE_OPTIONS_GET_PRIVATE(options);
   return &priv->write_options;
 }

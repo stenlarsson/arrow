@@ -139,4 +139,33 @@ garrow_csv_writer_new(GArrowOutputStream *sink,
                       GArrowCSVWriteOptions *options,
                       GError **error);
 
+#define GARROW_TYPE_JSON_WRITE_OPTIONS (garrow_json_write_options_get_type())
+GARROW_AVAILABLE_IN_23_0
+G_DECLARE_DERIVABLE_TYPE(
+  GArrowJSONWriteOptions, garrow_json_write_options, GARROW, JSON_WRITE_OPTIONS, GObject)
+struct _GArrowJSONWriteOptionsClass
+{
+  GObjectClass parent_class;
+};
+
+GARROW_AVAILABLE_IN_23_0
+GArrowJSONWriteOptions *
+garrow_json_write_options_new(void);
+
+#define GARROW_TYPE_JSON_WRITER (garrow_json_writer_get_type())
+GARROW_AVAILABLE_IN_23_0
+G_DECLARE_DERIVABLE_TYPE(
+  GArrowJSONWriter, garrow_json_writer, GARROW, JSON_WRITER, GArrowRecordBatchWriter)
+struct _GArrowJSONWriterClass
+{
+  GArrowRecordBatchWriterClass parent_class;
+};
+
+GARROW_AVAILABLE_IN_23_0
+GArrowJSONWriter *
+garrow_json_writer_new(GArrowOutputStream *sink,
+                       GArrowSchema *schema,
+                       GArrowJSONWriteOptions *options,
+                       GError **error);
+
 G_END_DECLS

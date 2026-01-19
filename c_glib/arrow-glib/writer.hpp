@@ -22,6 +22,8 @@
 #include <arrow/api.h>
 #include <arrow/csv/options.h>
 #include <arrow/csv/writer.h>
+#include <arrow/json/options.h>
+#include <arrow/json/writer.h>
 #include <arrow/ipc/api.h>
 #include <arrow/ipc/feather.h>
 
@@ -52,3 +54,11 @@ garrow_csv_writer_new_raw(std::shared_ptr<arrow::ipc::RecordBatchWriter> *arrow_
 GARROW_AVAILABLE_IN_23_0
 arrow::csv::WriteOptions *
 garrow_csv_write_options_get_raw(GArrowCSVWriteOptions *options);
+
+GARROW_AVAILABLE_IN_23_0
+GArrowJSONWriter *
+garrow_json_writer_new_raw(std::shared_ptr<arrow::ipc::RecordBatchWriter> *arrow_writer);
+
+GARROW_AVAILABLE_IN_23_0
+arrow::json::WriteOptions *
+garrow_json_write_options_get_raw(GArrowJSONWriteOptions *options);
