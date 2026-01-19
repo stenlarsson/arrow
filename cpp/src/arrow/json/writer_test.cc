@@ -158,7 +158,8 @@ TEST_F(TestWriteJSON, NestedStruct) {
 
   auto batch = RecordBatchFromJSON(schema, R"([
     {"id": 1, "data": {"name": "foo", "value": 42}},
-    {"id": 2, "data": {"name": "bar", "value": 100}}
+    {"id": 2, "data": {"name": "bar", "value": 100}},
+    {"id": 3}
   ])");
 
   WriteOptions options;
@@ -166,6 +167,7 @@ TEST_F(TestWriteJSON, NestedStruct) {
   EXPECT_EQ(json,
             R"({"id":1,"data":{"name":"foo","value":42}}
 {"id":2,"data":{"name":"bar","value":100}}
+{"id":3}
 )");
 }
 

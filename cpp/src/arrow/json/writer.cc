@@ -128,8 +128,9 @@ class ArrayWriter {
 public:
   ArrayWriter(const std::string& field_name,
                     std::vector<std::unique_ptr<rj::Writer<rj::StringBuffer>>>& writers,
-                    bool emit_null)
-      : field_name_(field_name), writers_(writers), emit_null_(emit_null) {}
+                    bool emit_null,
+                    const std::function<bool(int64_t)>& skip_row = nullptr)
+      : field_name_(field_name), writers_(writers), emit_null_(emit_null), skip_row_(skip_row) {}
 
   // Default implementation
   Status Visit(const arrow::Array& array) {
@@ -140,6 +141,9 @@ public:
   // Handle booleans
   Status Visit(const arrow::BooleanArray& array) {
     for (int64_t i = 0; i < array.length(); ++i) {
+      if (skip_row_ && skip_row_(i)) {
+        continue;
+      }
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
@@ -163,6 +167,9 @@ public:
     using CType = typename ArrayType::TypeClass::c_type;
 
     for (int64_t i = 0; i < array.length(); ++i) {
+      if (skip_row_ && skip_row_(i)) {
+        continue;
+      }
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
@@ -184,6 +191,9 @@ public:
   template <typename ArrayType, typename T = typename ArrayType::TypeClass>
   arrow::enable_if_string_like<T, arrow::Status> Visit(const ArrayType& array) {
     for (int64_t i = 0; i < array.length(); ++i) {
+      if (skip_row_ && skip_row_(i)) {
+        continue;
+      }
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
@@ -211,24 +221,33 @@ public:
       if (array.IsNull(i)) {
         writers_[i]->Null();
       } else {
-        // Start nested object
         writers_[i]->StartObject();
-        
-        // Write all child fields for this row
-        for (int child_idx = 0; child_idx < type->num_fields(); ++child_idx) {
-          const arrow::Field* child_field = type->field(child_idx).get();
-          const std::string child_field_name = child_field->name();
-          const arrow::Array* child_array = array.field(child_idx).get();
-          
-          // Write the child field key
-          writers_[i]->Key(child_field_name);
-          
-          // Write the single value for this row from the child array
-          ARROW_RETURN_NOT_OK(WriteSingleValue(*child_array, i, *writers_[i], emit_null_));
-        }
-        
-        // End nested object
-        writers_[i]->EndObject();
+      }
+    }
+
+    // Create a skip function that skips null struct rows
+    auto skip_null_struct = [&array, emit_null = emit_null_](int64_t i) -> bool {
+      return array.IsNull(i) && !emit_null;
+    };
+
+    for (int child_idx = 0; child_idx < type->num_fields(); ++child_idx) {
+      const arrow::Field* child_field = type->field(child_idx).get();
+      const std::string child_field_name = child_field->name();
+      const arrow::Array* child_array = array.field(child_idx).get();
+
+      // Use ArrayWriter with row filter to skip null struct rows
+      ArrayWriter child_writer(child_field_name, writers_, emit_null_, skip_null_struct);
+      ARROW_RETURN_NOT_OK(arrow::VisitArrayInline(*child_array, &child_writer));
+    }
+
+    // End objects for all rows
+    for (int64_t i = 0; i < array.length(); ++i) {
+      if (array.IsNull(i) && !emit_null_) {
+        continue;
+      }
+      if (!array.IsNull(i)) {
+        rj::Writer<rj::StringBuffer>* writer = writers_[i].get();
+        writer->EndObject();
       }
     }
     return Status::OK();
@@ -240,6 +259,9 @@ public:
     std::shared_ptr<arrow::Array> values = array.values();
 
     for (int64_t i = 0; i < array.length(); ++i) {
+      if (skip_row_ && skip_row_(i)) {
+        continue;
+      }
       if (array.IsNull(i) && !emit_null_) {
         continue;
       }
@@ -275,6 +297,9 @@ public:
   Status Visit(const arrow::NullArray& array) {
     if (emit_null_) {
       for (int64_t i = 0; i < array.length(); ++i) {
+        if (skip_row_ && skip_row_(i)) {
+          continue;
+        }
         writers_[i]->Key(field_name_);
         writers_[i]->Null();
       }
@@ -305,6 +330,7 @@ private:
   const std::string& field_name_;
   std::vector<std::unique_ptr<rj::Writer<rj::StringBuffer>>>& writers_;
   bool emit_null_;
+  const std::function<bool(int64_t)>& skip_row_;  // Optional function to skip rows
 };
  
 class JSONWriterImpl : public ipc::RecordBatchWriter {
